@@ -1,0 +1,51 @@
+name: smartfarm_field
+description: "SmartFarm Field - Saha Veri Toplama Uygulamasi"
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Harita
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+
+  # GPS - Yuksek hassasiyet modu
+  geolocator: ^11.0.0
+
+  # Kamera (image_picker kullanilir)
+  image_picker: ^1.1.2
+
+  # Yerel veritabani
+  sqflite: ^2.3.3+2
+  path_provider: ^2.1.4
+  path: ^1.9.0
+
+  # Networking
+  dio: ^5.9.1
+  connectivity_plus: ^6.1.1
+
+  # Firebase
+  firebase_core: ^3.4.0
+  firebase_storage: ^12.2.0
+
+  # Yerel depolama
+  shared_preferences: ^2.2.2
+
+  # UUID olusturma
+  uuid: ^4.5.1
+
+  # UI
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
