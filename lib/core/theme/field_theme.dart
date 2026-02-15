@@ -107,7 +107,7 @@ class FieldTheme {
         contentPadding: const EdgeInsets.all(16),
         labelStyle: const TextStyle(fontSize: 16),
       ),
-      cardTheme: CardTheme(
+      cardTheme: CardThemeData(
         color: surfaceCard,
         elevation: 2,
         shape: RoundedRectangleBorder(

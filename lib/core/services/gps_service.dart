@@ -83,10 +83,7 @@ class GpsService {
       }
     }
     final Position position = await Geolocator.getCurrentPosition(
-      locationSettings: const LocationSettings(
-        accuracy: LocationAccuracy.best,
-        distanceFilter: 0,
-      ),
+      desiredAccuracy: LocationAccuracy.best,
     );
     _lastPosition = position;
     final GpsPosition gpsPosition = _convertPosition(position);
