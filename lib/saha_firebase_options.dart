@@ -34,8 +34,8 @@ class SahaFirebaseOptions {
   // asagidaki degerleri gercek degerlerle degistirin.
   // Firebase Console > Project Settings > General > Your apps > Android
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyAsTm5vl_OT7r1X23QT3nw0i4lrUKZ5JVk',
-    appId: '1:344171333900:android:PLACEHOLDER_APP_ID',
+    apiKey: 'AIzaSyAsTm5vl_OT7r1X23QT3nw0i4lrUKZ5JVk', // Gecici API Key
+    appId: '1:344171333900:android:0000000000000000', // Gecici App ID
     messagingSenderId: '344171333900',
     projectId: 'farm-3aa9a',
     storageBucket: 'farm-3aa9a.firebasestorage.app',

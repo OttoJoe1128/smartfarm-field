@@ -16,6 +16,7 @@ class VarlikEklemeSayfasi extends StatefulWidget {
   final double? altitude;
   final double gpsAccuracy;
   final String initialAssetType;
+  final String? parcelId;
 
   const VarlikEklemeSayfasi({
     super.key,
@@ -24,6 +25,7 @@ class VarlikEklemeSayfasi extends StatefulWidget {
     this.altitude,
     required this.gpsAccuracy,
     this.initialAssetType = AssetType.agac,
+    this.parcelId,
   });
 
   @override
@@ -109,6 +111,7 @@ class _VarlikEklemeSayfasiState extends State<VarlikEklemeSayfasi> {
         healthStatus: _selectedHealthStatus,
         notes: _notesController.text.isNotEmpty ? _notesController.text.trim() : null,
         iotConnected: _iotConnected,
+        parcelId: widget.parcelId,
         userId: userId,
         syncStatus: SyncStatus.pendingSync,
         createdAt: DateTime.now(),

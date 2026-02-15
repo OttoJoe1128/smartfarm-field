@@ -4,6 +4,8 @@ import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/config/api_config.dart';
 import '../models/field_asset.dart';
+import '../models/fault_record.dart';
+import '../models/parcel.dart';
 
 /// Saha uygulamasi Backend API istemcisi
 /// Mevcut auth sistemi ile uyumlu JWT tabanli iletisim
@@ -169,6 +171,37 @@ class SahaApiService {
       return response.data as List<dynamic>;
     } catch (e) {
       debugPrint('Harita verisi alma hatasi: $e');
+      return [];
+    }
+  }
+
+  // --- Fault Reporting ---
+
+  /// Ariza kaydi olustur
+  Future<bool> addFaultRecord(FaultRecord fault) async {
+    try {
+      final Response<dynamic> response = await _dio.post(
+        '/gis/add-fault',
+        data: fault.toApiPayload(),
+      );
+      return response.statusCode == 200;
+    } catch (e) {
+      debugPrint('Ariza kaydi ekleme hatasi: $e');
+      return false;
+    }
+    }
+  }
+
+  // --- Parcel ---
+
+  /// Kullaniciya ait parselleri getir
+  Future<List<Parcel>> getUserParcels() async {
+    try {
+      final Response<dynamic> response = await _dio.get('/gis/parcels');
+      final List<dynamic> data = response.data as List<dynamic>;
+      return data.map((json) => Parcel.fromMap(json)).toList();
+    } catch (e) {
+      debugPrint('Parsel verisi alma hatasi: $e');
       return [];
     }
   }

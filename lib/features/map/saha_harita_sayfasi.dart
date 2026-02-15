@@ -3,12 +3,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import '../../core/services/gps_service.dart';
+import '../../core/services/sync_service.dart';
 import '../../core/theme/field_theme.dart';
 import '../../data/local/database_helper.dart';
 import '../../data/models/field_asset.dart';
 import '../asset/varlik_ekleme_sayfasi.dart';
 import '../asset/varlik_listesi_sayfasi.dart';
 import '../sync/senkronizasyon_sayfasi.dart';
+import '../../data/models/fault_record.dart';
+import '../../data/models/parcel.dart';
+import '../../core/utils/geometry_utils.dart';
+import 'package:uuid/uuid.dart';
 
 /// Ana saha harita ekrani
 /// Tam ekran harita, GPS gostergesi ve hizli varlik ekleme
@@ -28,6 +33,7 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
 
   GpsPosition? _currentPosition;
   List<FieldAsset> _assets = [];
+  List<Parcel> _parcels = [];
   int _pendingSyncCount = 0;
   String _selectedAssetType = AssetType.agac;
   bool _isGpsActive = false;
@@ -87,10 +93,12 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
 
   Future<void> _loadAssets() async {
     final List<FieldAsset> assets = await _dbHelper.getTodayAssets();
+    final List<Parcel> parcels = await _dbHelper.getAllParcels();
     final int pendingCount = await _dbHelper.getPendingSyncCount();
     if (mounted) {
       setState(() {
         _assets = assets;
+        _parcels = parcels;
         _pendingSyncCount = pendingCount;
       });
     }
@@ -106,6 +114,45 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
       if (!shouldProceed) return;
     }
     if (!mounted) return;
+
+    // Parsel kontrolü
+    String? foundParcelId;
+    final LatLng currentLatLng = LatLng(_currentPosition!.latitude, _currentPosition!.longitude);
+    
+    for (final Parcel parcel in _parcels) {
+      if (GeometryUtils.isPointInPolygon(currentLatLng, parcel.boundary)) {
+        foundParcelId = parcel.id;
+        break;
+      }
+    }
+
+    if (foundParcelId == null) {
+      // Parsel disinda uyari
+      final bool? proceed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Parsel Disi Islem'),
+          content: const Text(
+            'Bulundugunuz konum tanimli hicbir parsel icinde degil. '
+            'Yine de varlik eklemek istiyor musunuz?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Iptal'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Devam Et'),
+            ),
+          ],
+        ),
+      );
+      if (proceed != true) return;
+    } else {
+      _showSnackBar('Parsel algilandi: ${foundParcelId}');
+    }
+
     final bool? result = await Navigator.of(context).push<bool>(
       MaterialPageRoute(
         builder: (BuildContext context) => VarlikEklemeSayfasi(
@@ -114,6 +161,7 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
           altitude: _currentPosition!.altitude,
           gpsAccuracy: _currentPosition!.accuracy,
           initialAssetType: _selectedAssetType,
+          parcelId: foundParcelId,
         ),
       ),
     );
@@ -208,6 +256,18 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
           urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
           userAgentPackageName: 'com.smartfarmxr.smartfarm_field',
         ),
+        // Parsel Poligonlari
+        PolygonLayer(
+          polygons: _parcels.map((parcel) {
+            return Polygon(
+              points: parcel.boundary,
+              color: FieldTheme.primaryGreen.withValues(alpha: 0.1),
+              borderStrokeWidth: 2,
+              borderColor: FieldTheme.primaryGreen,
+              isFilled: true,
+            );
+          }).toList(),
+        ),
         // Mevcut konum marker
         if (_currentPosition != null)
           MarkerLayer(
@@ -257,27 +317,145 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
         : asset.isSyncFailed
             ? FieldTheme.syncFailed
             : FieldTheme.syncPending;
-    return Container(
-      decoration: BoxDecoration(
-        color: markerColor,
-        shape: BoxShape.circle,
-        border: Border.all(color: Colors.white, width: 2),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withValues(alpha: 0.3),
-            blurRadius: 4,
-            offset: const Offset(0, 2),
+    return GestureDetector(
+      onTap: () => _showAssetOptions(asset),
+      child: Container(
+        decoration: BoxDecoration(
+          color: markerColor,
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white, width: 2),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.3),
+              blurRadius: 4,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Center(
+          child: Icon(
+            _getIconForAssetType(asset.assetType),
+            color: Colors.white,
+            size: 18,
           ),
-        ],
-      ),
-      child: Center(
-        child: Icon(
-          _getIconForAssetType(asset.assetType),
-          color: Colors.white,
-          size: 18,
         ),
       ),
     );
+  }
+
+  void _showAssetOptions(FieldAsset asset) {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: Icon(_getIconForAssetType(asset.assetType)),
+                title: Text(asset.name),
+                subtitle: Text('${asset.assetType} - ${asset.syncStatus}'),
+              ),
+              const Divider(),
+              ListTile(
+                leading: const Icon(Icons.report_problem, color: Colors.orange),
+                title: const Text('Ariza Bildir'),
+                onTap: () {
+                  Navigator.pop(context);
+                  _showFaultDialog(asset);
+                },
+              ),
+              ListTile(
+                leading: const Icon(Icons.info_outline),
+                title: const Text('Detaylar'),
+                onTap: () {
+                  Navigator.pop(context);
+                  // Detay sayfasi eklenebilir
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Future<void> _showFaultDialog(FieldAsset asset) async {
+    final TextEditingController descriptionController = TextEditingController();
+    String severity = 'medium';
+    
+    final bool? result = await showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              title: const Text('Ariza Bildirimi'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('${asset.name} icin ariza kaydi'),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: descriptionController,
+                    decoration: const InputDecoration(
+                      labelText: 'Ariza Aciklamasi',
+                      border: OutlineInputBorder(),
+                    ),
+                    maxLines: 3,
+                  ),
+                  const SizedBox(height: 16),
+                  DropdownButtonFormField<String>(
+                    value: severity,
+                    decoration: const InputDecoration(labelText: 'Oncelik'),
+                    items: const [
+                      DropdownMenuItem(value: 'low', child: Text('Dusuk')),
+                      DropdownMenuItem(value: 'medium', child: Text('Orta')),
+                      DropdownMenuItem(value: 'high', child: Text('Yuksek')),
+                      DropdownMenuItem(value: 'critical', child: Text('Kritik')),
+                    ],
+                    onChanged: (value) {
+                      setState(() {
+                        severity = value!;
+                      });
+                    },
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context, false),
+                  child: const Text('Iptal'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.pop(context, true),
+                  child: const Text('Gonder'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result == true && descriptionController.text.isNotEmpty) {
+      final FaultRecord fault = FaultRecord(
+        id: const Uuid().v4(),
+        assetId: asset.id,
+        description: descriptionController.text,
+        severity: severity,
+        createdAt: DateTime.now(),
+      );
+      
+      await _dbHelper.insertFault(fault);
+      
+      // Anlik sync tetikle (fire and forget)
+      SyncService().syncNow();
+      
+      if (mounted) {
+        _showSnackBar('Ariza kaydi olusturuldu ve gonderiliyor...');
+      }
+    }
   }
 
   Widget _buildGpsIndicator() {

@@ -2,6 +2,8 @@ import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart';
 import 'package:path_provider/path_provider.dart';
 import '../models/field_asset.dart';
+import '../models/fault_record.dart';
+import '../models/parcel.dart';
 
 /// SQLite veritabani yardimcisi
 /// Offline-first mimari icin yerel veri saklama
@@ -19,6 +21,9 @@ class DatabaseHelper {
   // Tablo adlari
   static const String tableFieldAssets = 'field_assets';
   static const String tableSyncQueue = 'sync_queue';
+  static const String tableSyncQueue = 'sync_queue';
+  static const String tableFaultRecords = 'fault_records';
+  static const String tableParcels = 'parcels';
 
   /// Veritabanini getir (lazy initialization)
   Future<Database> get database async {
@@ -76,6 +81,22 @@ class DatabaseHelper {
         FOREIGN KEY (asset_local_id) REFERENCES $tableFieldAssets (id)
       )
     ''');
+    await db.execute('''
+      CREATE TABLE $tableFaultRecords (
+        id TEXT PRIMARY KEY,
+        asset_id TEXT NOT NULL,
+        description TEXT,
+        severity TEXT,
+        status TEXT,
+        photo_local_path TEXT,
+        photo_url TEXT,
+        user_id TEXT,
+        sync_status TEXT DEFAULT 'pending_sync',
+        created_at TEXT NOT NULL,
+        resolved_at TEXT,
+        FOREIGN KEY (asset_id) REFERENCES $tableFieldAssets (id)
+      )
+    ''');
     // Indeksler
     await db.execute(
       'CREATE INDEX idx_field_assets_sync_status ON $tableFieldAssets (sync_status)',
@@ -86,6 +107,21 @@ class DatabaseHelper {
     await db.execute(
       'CREATE INDEX idx_sync_queue_asset ON $tableSyncQueue (asset_local_id)',
     );
+     await db.execute(
+      'CREATE INDEX idx_fault_records_sync_status ON $tableFaultRecords (sync_status)',
+    );
+    await db.execute(
+      'CREATE INDEX idx_fault_records_asset ON $tableFaultRecords (asset_id)',
+    );
+
+    // Parsel tablosu
+    await db.execute('''
+      CREATE TABLE $tableParcels (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        boundary TEXT
+      )
+    ''');
   }
 
   /// Veritabani yukseltme (gelecek surumlere hazirlama)
@@ -248,6 +284,74 @@ class DatabaseHelper {
     };
   }
 
+  // --- Fault Records CRUD ---
+
+  /// Yeni ariza kaydi ekle
+  Future<void> insertFault(FaultRecord fault) async {
+    final db = await database;
+    await db.insert(
+      tableFaultRecords,
+      fault.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// Ariza kaydini guncelle
+  Future<void> updateFault(FaultRecord fault) async {
+    final db = await database;
+    await db.update(
+      tableFaultRecords,
+      fault.toMap(),
+      where: 'id = ?',
+      whereArgs: [fault.id],
+    );
+  }
+
+  /// Bir varliga ait arıza kayitlarini getir
+  Future<List<FaultRecord>> getFaultsByAssetId(String assetId) async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      tableFaultRecords,
+      where: 'asset_id = ?',
+      whereArgs: [assetId],
+      orderBy: 'created_at DESC',
+    );
+    return maps.map((map) => FaultRecord.fromMap(map)).toList();
+  }
+
+  /// Senkronizasyon bekleyen ariza kayitlarini getir
+  Future<List<FaultRecord>> getFaultsBySyncStatus(String syncStatus) async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(
+      tableFaultRecords,
+      where: 'sync_status = ?',
+      whereArgs: [syncStatus],
+      orderBy: 'created_at ASC',
+    );
+    return maps.map((map) => FaultRecord.fromMap(map)).toList();
+  }
+
+  /// Ariza senkronizasyon durumunu guncelle
+  Future<void> updateFaultSyncStatus(
+    String faultId,
+    String syncStatus, {
+    String? photoUrl,
+  }) async {
+    final db = await database;
+    final Map<String, dynamic> values = {
+      'sync_status': syncStatus,
+    };
+    if (photoUrl != null) {
+      values['photo_url'] = photoUrl;
+    }
+    await db.update(
+      tableFaultRecords,
+      values,
+      where: 'id = ?',
+      whereArgs: [faultId],
+    );
+  }
+
   // --- Sync Queue ---
 
   /// Senkronizasyon kuyruğuna ekle
@@ -304,5 +408,30 @@ class DatabaseHelper {
     final db = await database;
     await db.close();
     _database = null;
+  }
+  // ---------------------------------------------------------------------------
+  // Parsel Islemleri
+  // ---------------------------------------------------------------------------
+
+  Future<void> insertParcel(Parcel parcel) async {
+    final db = await database;
+    await db.insert(
+      tableParcels,
+      parcel.toMap(),
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  Future<List<Parcel>> getAllParcels() async {
+    final db = await database;
+    final List<Map<String, dynamic>> maps = await db.query(tableParcels);
+    return List.generate(maps.length, (i) {
+      return Parcel.fromMap(maps[i]);
+    });
+  }
+  
+  Future<void> clearParcels() async {
+    final db = await database;
+    await db.delete(tableParcels);
   }
 }

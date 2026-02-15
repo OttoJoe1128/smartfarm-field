@@ -5,6 +5,7 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import '../../data/local/database_helper.dart';
 import '../../data/models/field_asset.dart';
+import '../../data/models/fault_record.dart';
 import '../../data/remote/saha_api_service.dart';
 import '../config/api_config.dart';
 
@@ -144,6 +145,30 @@ class SyncService {
             debugPrint('Sync hatasi (${asset.id}): $e');
           }
         }
+        }
+      }
+
+      // ----------------------------------------------------------------------
+      // Ariza Kayitlari Senkronizasyonu
+      // ----------------------------------------------------------------------
+      final List<FaultRecord> pendingFaults =
+          await _dbHelper.getFaultsBySyncStatus(SyncStatus.pendingSync);
+      final List<FaultRecord> failedFaults =
+          await _dbHelper.getFaultsBySyncStatus(SyncStatus.syncFailed);
+      final List<FaultRecord> allFaultsToSync = [...pendingFaults, ...failedFaults];
+
+      if (allFaultsToSync.isNotEmpty) {
+        debugPrint('Senkronize edilecek ariza kaydi sayisi: ${allFaultsToSync.length}');
+        for (final FaultRecord fault in allFaultsToSync) {
+          try {
+            await _syncSingleFaultRecord(fault);
+            successCount++;
+          } catch (e) {
+            failedCount++;
+            errors.add('Ariza (${fault.description}): $e');
+            debugPrint('Ariza sync hatasi (${fault.id}): $e');
+          }
+        }
       }
     } catch (e) {
       debugPrint('Genel sync hatasi: $e');
@@ -186,6 +211,42 @@ class SyncService {
     } else {
       // 5. Basarisiz: retry mekanizmasi
       await _handleSyncFailure(asset);
+    }
+  }
+
+  /// Tek bir ariza kaydini senkronize et
+  Future<void> _syncSingleFaultRecord(FaultRecord fault) async {
+    String? photoUrl;
+    // 1. Fotograf varsa Firebase Storage'a yukle
+    if (fault.photoLocalPath != null && fault.photoUrl == null) {
+      photoUrl = await _uploadPhotoToFirebase(
+        fault.photoLocalPath!,
+        'fault_${fault.id}', // Dosya ismine prefix ekle veya farkli klasor kullanilabilir
+      );
+    }
+
+    // 2. Varlik verisini guncelle (foto URL ekle)
+    final FaultRecord faultToSync = photoUrl != null
+        ? fault.copyWith(photoUrl: photoUrl)
+        : fault;
+
+    // 3. Backend'e gonder
+    final bool isSuccess = await _apiService.addFaultRecord(faultToSync);
+
+    if (isSuccess) {
+      // 4. Basarili: sync_status = synced
+      await _dbHelper.updateFaultSyncStatus(
+        fault.id,
+        SyncStatus.synced,
+        photoUrl: photoUrl,
+      );
+    } else {
+      // 5. Basarisiz: Basitce syncFailed olarak isaretle
+      // (Ileride gelismis retry kuyrugu eklenebilir)
+      await _dbHelper.updateFaultSyncStatus(
+        fault.id,
+        SyncStatus.syncFailed,
+      );
     }
   }
 
