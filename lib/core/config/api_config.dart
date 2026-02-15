@@ -19,12 +19,13 @@ class ApiConfig {
     if (envUrl != null && envUrl.isNotEmpty) {
       return envUrl;
     }
+    // Linux (IDX/masaustu): localhost
+    if (Platform.isLinux) {
+      return 'http://127.0.0.1:8000/api/v1';
+    }
     // Varsayilan: Android emulator localhost adresi
-    return _defaultBaseUrl;
+    return 'http://10.0.2.2:8000/api/v1';
   }
-
-  /// Varsayilan backend adresi
-  static const String _defaultBaseUrl = 'http://10.0.2.2:8000/api/v1';
 
   /// Baglanti zaman asimi (saniye)
   static const int connectTimeoutSeconds = 15;
