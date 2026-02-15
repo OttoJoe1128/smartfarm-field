@@ -11,8 +11,10 @@ class SahaApiService {
   late final Dio _dio;
 
   SahaApiService() {
+    final String resolvedUrl = ApiConfig.baseUrl;
+    debugPrint('SahaApiService: Backend URL = $resolvedUrl');
     _dio = Dio(BaseOptions(
-      baseUrl: ApiConfig.baseUrl,
+      baseUrl: resolvedUrl,
       connectTimeout: Duration(seconds: ApiConfig.connectTimeoutSeconds),
       receiveTimeout: Duration(seconds: ApiConfig.receiveTimeoutSeconds),
       headers: {'Content-Type': 'application/json'},
