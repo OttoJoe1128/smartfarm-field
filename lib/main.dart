@@ -9,9 +9,6 @@ import 'features/auth/saha_giris_sayfasi.dart';
 import 'features/map/saha_harita_sayfasi.dart';
 import 'saha_firebase_options.dart';
 
-/// Firebase baslatildi mi flag
-bool _isFirebaseInitialized = false;
-
 Future<void> main() async {
   runZonedGuarded(() async {
     WidgetsFlutterBinding.ensureInitialized();
@@ -24,10 +21,8 @@ Future<void> main() async {
       await Firebase.initializeApp(
         options: SahaFirebaseOptions.currentPlatform,
       );
-      _isFirebaseInitialized = true;
       debugPrint('Firebase basariyla baslatildi');
     } catch (e) {
-      _isFirebaseInitialized = false;
       debugPrint('Firebase init hatasi: $e');
       debugPrint('Uygulama Firebase olmadan devam edecek. '
           'Fotograf yukleme ve sync devre disi olabilir.');
@@ -77,7 +72,9 @@ class _SmartFarmFieldAppState extends State<SmartFarmFieldApp> {
             _isLoading = false;
           });
           if (_isLoggedIn) {
+            await _syncService.executePhaseThreeReadiness();
             _syncService.startAutoSync();
+            await _syncService.startLiveEventStream();
           }
         }
       } else {
@@ -103,11 +100,14 @@ class _SmartFarmFieldAppState extends State<SmartFarmFieldApp> {
     setState(() {
       _isLoggedIn = true;
     });
+    _syncService.executePhaseThreeReadiness();
     _syncService.startAutoSync();
+    _syncService.startLiveEventStream();
   }
 
   Future<void> _handleLogout() async {
     _syncService.stopAutoSync();
+    await _syncService.stopLiveEventStream();
     final SahaApiService apiService = SahaApiService();
     await apiService.logout();
     final SharedPreferences prefs = await SharedPreferences.getInstance();

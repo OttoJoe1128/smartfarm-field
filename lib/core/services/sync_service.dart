@@ -1,8 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import '../../data/local/database_helper.dart';
 import '../../data/models/field_asset.dart';
 import '../../data/models/fault_record.dart';
@@ -69,15 +72,21 @@ class SyncService {
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   Timer? _autoSyncTimer;
+  WebSocket? _liveWebSocket;
   bool _isSyncing = false;
   bool _isAutoSyncEnabled = false;
+  bool _isLiveStreamActive = false;
   int? _lastServerVersion;
   int? get lastServerVersion => _lastServerVersion;
+  bool get isLiveStreamActive => _isLiveStreamActive;
 
   /// Senkronizasyon durumu akisi
   final StreamController<SyncResult> _syncResultController =
       StreamController<SyncResult>.broadcast();
   Stream<SyncResult> get syncResultStream => _syncResultController.stream;
+  final StreamController<Map<String, dynamic>> _liveEventController =
+      StreamController<Map<String, dynamic>>.broadcast();
+  Stream<Map<String, dynamic>> get liveEventStream => _liveEventController.stream;
 
   /// Otomatik senkronizasyonu baslat
   void startAutoSync() {
@@ -400,6 +409,102 @@ class SyncService {
   /// Servisi temizle
   void dispose() {
     stopAutoSync();
+    stopLiveEventStream();
     _syncResultController.close();
+    _liveEventController.close();
+  }
+
+  /// Faz 3 icin onboarding ve kontrat metadata hazirligi
+  Future<Map<String, dynamic>> executePhaseThreeReadiness() async {
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    String? deviceId = prefs.getString('field_device_id');
+    if (deviceId == null || deviceId.isEmpty) {
+      deviceId = const Uuid().v4();
+      await prefs.setString('field_device_id', deviceId);
+    }
+    final Map<String, dynamic> contractResponse = await _apiService.getContracts();
+    final bool isSuccess = (contractResponse['status'] as String?) == 'ok';
+    if (!isSuccess) {
+      return {
+        'status': 'error',
+        'error_code': contractResponse['error_code'] ?? 'CONTRACT_DISCOVERY_ERROR',
+        'message': contractResponse['message'] ?? 'Kontratlar alinmadi',
+      };
+    }
+    final int? versionValue = contractResponse['version'] as int?;
+    _lastServerVersion = versionValue ?? _lastServerVersion;
+    await prefs.setString('field_ws_url', _apiService.buildLiveWebSocketUrl());
+    if (versionValue != null) {
+      await prefs.setInt('field_server_version', versionValue);
+    }
+    return {
+      'status': 'ok',
+      'device_id': deviceId,
+      'server_version': _lastServerVersion,
+      'ws_url': _apiService.buildLiveWebSocketUrl(),
+    };
+  }
+
+  /// Canli veri omurgasi icin WebSocket baglantisini baslat
+  Future<void> startLiveEventStream() async {
+    if (_isLiveStreamActive) {
+      return;
+    }
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    final String? accessToken = prefs.getString('access_token');
+    if (accessToken == null || accessToken.isEmpty) {
+      _liveEventController.add({
+        'type': 'error',
+        'error_code': 'MISSING_ACCESS_TOKEN',
+        'message': 'Canli stream icin access token bulunamadi',
+      });
+      return;
+    }
+    final String wsUrl = _apiService.buildLiveWebSocketUrl();
+    try {
+      _liveWebSocket = await WebSocket.connect(
+        wsUrl,
+        headers: <String, dynamic>{'Authorization': 'Bearer $accessToken'},
+      );
+      _isLiveStreamActive = true;
+      _liveWebSocket!.listen(
+        (dynamic rawEvent) {
+          if (rawEvent is String) {
+            final dynamic decoded = jsonDecode(rawEvent);
+            if (decoded is Map<String, dynamic>) {
+              _liveEventController.add(decoded);
+            }
+          }
+        },
+        onDone: () {
+          _isLiveStreamActive = false;
+        },
+        onError: (Object err) {
+          _isLiveStreamActive = false;
+          _liveEventController.add({
+            'type': 'error',
+            'error_code': 'LIVE_STREAM_ERROR',
+            'message': err.toString(),
+          });
+        },
+        cancelOnError: false,
+      );
+    } catch (e) {
+      _isLiveStreamActive = false;
+      _liveEventController.add({
+        'type': 'error',
+        'error_code': 'LIVE_STREAM_CONNECT_FAILED',
+        'message': e.toString(),
+      });
+    }
+  }
+
+  /// Canli veri WebSocket baglantisini durdur
+  Future<void> stopLiveEventStream() async {
+    if (_liveWebSocket != null) {
+      await _liveWebSocket!.close();
+      _liveWebSocket = null;
+    }
+    _isLiveStreamActive = false;
   }
 }

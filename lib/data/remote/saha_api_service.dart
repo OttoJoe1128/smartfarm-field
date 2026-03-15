@@ -214,6 +214,29 @@ class SahaApiService {
     }
   }
 
+  /// Backend kontratlarini getir
+  Future<Map<String, dynamic>> getContracts() async {
+    try {
+      final Response<dynamic> response = await _dio.get('/contracts');
+      return _parseApiYanit(response).toMap();
+    } catch (e) {
+      debugPrint('Kontrat alma hatasi: $e');
+      return _buildErrorYanit(
+        error: e,
+        fallbackCode: 'CONTRACT_DISCOVERY_ERROR',
+      ).toMap();
+    }
+  }
+
+  /// API base URL'den WebSocket URL olustur
+  String buildLiveWebSocketUrl() {
+    String wsUrl = ApiConfig.baseUrl;
+    wsUrl = wsUrl.replaceFirst('https://', 'wss://');
+    wsUrl = wsUrl.replaceFirst('http://', 'ws://');
+    wsUrl = wsUrl.replaceFirst('/api/v1', '');
+    return '$wsUrl/ws/live';
+  }
+
   // --- Fault Reporting ---
 
   /// Ariza kaydi olustur
