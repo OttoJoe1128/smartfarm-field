@@ -67,6 +67,7 @@ class LiveProjectionState {
   final DateTime? lastEventAt;
   final String? lastEventType;
   final Map<String, Map<String, dynamic>> telemetryByAssetId;
+  final Map<String, int> alertCountByAssetId;
   const LiveProjectionState({
     required this.isConnected,
     required this.reconnectAttempt,
@@ -74,6 +75,7 @@ class LiveProjectionState {
     this.lastEventAt,
     this.lastEventType,
     this.telemetryByAssetId = const <String, Map<String, dynamic>>{},
+    this.alertCountByAssetId = const <String, int>{},
   });
 }
 
@@ -103,6 +105,7 @@ class SyncService {
   final List<Map<String, dynamic>> _liveAlerts = <Map<String, dynamic>>[];
   final Map<String, Map<String, dynamic>> _telemetryByAssetId =
       <String, Map<String, dynamic>>{};
+  final Map<String, int> _alertCountByAssetId = <String, int>{};
   int? get lastServerVersion => _lastServerVersion;
   bool get isLiveStreamActive => _isLiveStreamActive;
 
@@ -126,6 +129,7 @@ class SyncService {
         telemetryByAssetId: Map<String, Map<String, dynamic>>.from(
           _telemetryByAssetId,
         ),
+        alertCountByAssetId: Map<String, int>.from(_alertCountByAssetId),
       );
 
   /// Otomatik senkronizasyonu baslat
@@ -639,7 +643,14 @@ class SyncService {
       if (alertsNode is List) {
         for (final dynamic alertItem in alertsNode) {
           if (alertItem is Map<String, dynamic>) {
-            _liveAlerts.add(Map<String, dynamic>.from(alertItem));
+            final Map<String, dynamic> normalizedAlert =
+                Map<String, dynamic>.from(alertItem);
+            _liveAlerts.add(normalizedAlert);
+            final String alertAssetId = (normalizedAlert['asset_id'] as String?) ?? '';
+            if (alertAssetId.isNotEmpty) {
+              final int currentCount = _alertCountByAssetId[alertAssetId] ?? 0;
+              _alertCountByAssetId[alertAssetId] = currentCount + 1;
+            }
           }
         }
         if (_liveAlerts.length > 200) {
@@ -667,6 +678,7 @@ class SyncService {
         telemetryByAssetId: Map<String, Map<String, dynamic>>.from(
           _telemetryByAssetId,
         ),
+        alertCountByAssetId: Map<String, int>.from(_alertCountByAssetId),
       ),
     );
   }

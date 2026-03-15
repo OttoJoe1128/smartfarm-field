@@ -1,5 +1,7 @@
 import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
+import '../../core/services/sync_service.dart';
 import '../../core/theme/field_theme.dart';
 import '../../data/local/database_helper.dart';
 import '../../data/models/field_asset.dart';
@@ -17,15 +19,44 @@ class VarlikListesiSayfasi extends StatefulWidget {
 
 class _VarlikListesiSayfasiState extends State<VarlikListesiSayfasi> {
   final DatabaseHelper _dbHelper = DatabaseHelper();
+  final SyncService _syncService = SyncService();
   List<FieldAsset> _assets = [];
   bool _isLoading = true;
   String? _filterType;
   String? _filterSyncStatus;
+  Map<String, Map<String, dynamic>> _liveTelemetryByAssetId =
+      <String, Map<String, dynamic>>{};
+  Map<String, int> _liveAlertCountByAssetId = <String, int>{};
+  StreamSubscription<LiveProjectionState>? _liveProjectionSubscription;
 
   @override
   void initState() {
     super.initState();
     _loadAssets();
+    _bindLiveProjection();
+  }
+
+  @override
+  void dispose() {
+    _liveProjectionSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _bindLiveProjection() {
+    final LiveProjectionState snapshot = _syncService.liveProjectionSnapshot;
+    _liveTelemetryByAssetId = snapshot.telemetryByAssetId;
+    _liveAlertCountByAssetId = snapshot.alertCountByAssetId;
+    _liveProjectionSubscription = _syncService.liveProjectionStream.listen(
+      (LiveProjectionState state) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _liveTelemetryByAssetId = state.telemetryByAssetId;
+          _liveAlertCountByAssetId = state.alertCountByAssetId;
+        });
+      },
+    );
   }
 
   Future<void> _loadAssets() async {
@@ -225,6 +256,8 @@ class _VarlikListesiSayfasiState extends State<VarlikListesiSayfasi> {
             ),
             const SizedBox(height: 4),
             _buildSyncBadge(asset),
+            const SizedBox(height: 4),
+            _buildLiveTelemetryBadge(asset),
           ],
         ),
         trailing: IconButton(
@@ -308,6 +341,87 @@ class _VarlikListesiSayfasiState extends State<VarlikListesiSayfasi> {
         ],
       ),
     );
+  }
+
+  Widget _buildLiveTelemetryBadge(FieldAsset asset) {
+    final Map<String, dynamic>? telemetryNode = _liveTelemetryByAssetId[asset.id];
+    final int alertCount = _liveAlertCountByAssetId[asset.id] ?? 0;
+    final bool hasLiveData = telemetryNode != null;
+    final String lastSeen = hasLiveData
+        ? (telemetryNode['measured_at'] as String? ?? 'Bilinmiyor')
+        : 'Canli veri yok';
+    final String metricsSummary = hasLiveData
+        ? _buildMetricsSummary(telemetryNode['metrics'])
+        : 'Olcum alinmadi';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: hasLiveData
+            ? FieldTheme.primaryGreen.withValues(alpha: 0.08)
+            : FieldTheme.textSecondary.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                hasLiveData ? Icons.podcasts : Icons.podcasts_outlined,
+                size: 14,
+                color: hasLiveData ? FieldTheme.primaryGreen : FieldTheme.textSecondary,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                hasLiveData ? 'Canli veri aktif' : 'Canli veri bekleniyor',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: hasLiveData ? FieldTheme.primaryGreen : FieldTheme.textSecondary,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(width: 8),
+              if (alertCount > 0)
+                Badge(
+                  label: Text(
+                    '$alertCount',
+                    style: const TextStyle(fontSize: 10),
+                  ),
+                  child: const Icon(
+                    Icons.notification_important,
+                    size: 14,
+                    color: FieldTheme.errorRed,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 2),
+          Text(
+            'Son olcum: $lastSeen',
+            style: const TextStyle(fontSize: 11, color: FieldTheme.textSecondary),
+          ),
+          Text(
+            'Metrik: $metricsSummary',
+            style: const TextStyle(fontSize: 11, color: FieldTheme.textSecondary),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _buildMetricsSummary(dynamic metricsNode) {
+    if (metricsNode is! Map<String, dynamic> || metricsNode.isEmpty) {
+      return 'Yok';
+    }
+    final List<String> pairs = <String>[];
+    metricsNode.forEach((dynamic key, dynamic value) {
+      if (pairs.length >= 2) {
+        return;
+      }
+      pairs.add('$key=$value');
+    });
+    return pairs.isEmpty ? 'Yok' : pairs.join(', ');
   }
 
   IconData _getIconForType(String type) {
