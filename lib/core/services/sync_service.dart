@@ -14,11 +14,45 @@ class SyncResult {
   final int successCount;
   final int failedCount;
   final List<String> errors;
+  final List<String> errorCodes;
+  final int? serverVersion;
 
   const SyncResult({
     required this.successCount,
     required this.failedCount,
     this.errors = const [],
+    this.errorCodes = const [],
+    this.serverVersion,
+  });
+}
+
+/// Varlik batch senkronizasyon sonucu
+class BatchAssetSyncResult {
+  final int successCount;
+  final int failedCount;
+  final List<String> errors;
+  final List<String> errorCodes;
+  final int? serverVersion;
+  const BatchAssetSyncResult({
+    required this.successCount,
+    required this.failedCount,
+    this.errors = const [],
+    this.errorCodes = const [],
+    this.serverVersion,
+  });
+}
+
+/// Ariza senkronizasyon sonucu
+class FaultSyncResult {
+  final bool isSuccess;
+  final String? errorCode;
+  final String? errorMessage;
+  final int? serverVersion;
+  const FaultSyncResult({
+    required this.isSuccess,
+    this.errorCode,
+    this.errorMessage,
+    this.serverVersion,
   });
 }
 
@@ -37,6 +71,8 @@ class SyncService {
   Timer? _autoSyncTimer;
   bool _isSyncing = false;
   bool _isAutoSyncEnabled = false;
+  int? _lastServerVersion;
+  int? get lastServerVersion => _lastServerVersion;
 
   /// Senkronizasyon durumu akisi
   final StreamController<SyncResult> _syncResultController =
@@ -80,7 +116,7 @@ class SyncService {
   void _startPeriodicSync() {
     _autoSyncTimer?.cancel();
     _autoSyncTimer = Timer.periodic(
-      Duration(seconds: ApiConfig.syncIntervalSeconds),
+      const Duration(seconds: ApiConfig.syncIntervalSeconds),
       (_) async {
         if (_isAutoSyncEnabled && !_isSyncing) {
           final bool isConnected = await _isOnline();
@@ -111,6 +147,8 @@ class SyncService {
     int successCount = 0;
     int failedCount = 0;
     final List<String> errors = [];
+    final List<String> errorCodes = [];
+    int? currentServerVersion = _lastServerVersion;
     try {
       final bool isConnected = await _isOnline();
       if (!isConnected) {
@@ -118,6 +156,7 @@ class SyncService {
           successCount: 0,
           failedCount: 0,
           errors: ['Internet baglantisi yok'],
+          errorCodes: ['NO_INTERNET'],
         );
       }
       // Bekleyen ve basarisiz kayitlari getir
@@ -126,25 +165,21 @@ class SyncService {
       final List<FieldAsset> failedAssets =
           await _dbHelper.getAssetsBySyncStatus(SyncStatus.syncFailed);
       final List<FieldAsset> allToSync = [...pendingAssets, ...failedAssets];
-      if (allToSync.isEmpty) {
-        return const SyncResult(successCount: 0, failedCount: 0);
-      }
-      // Batch isleme - ayni anda max 5 kayit
-      for (int i = 0; i < allToSync.length; i += ApiConfig.maxBatchSize) {
-        final int end = (i + ApiConfig.maxBatchSize < allToSync.length)
-            ? i + ApiConfig.maxBatchSize
-            : allToSync.length;
-        final List<FieldAsset> batch = allToSync.sublist(i, end);
-        for (final FieldAsset asset in batch) {
-          try {
-            await _syncSingleAsset(asset);
-            successCount++;
-          } catch (e) {
-            failedCount++;
-            errors.add('${asset.name}: $e');
-            debugPrint('Sync hatasi (${asset.id}): $e');
+      if (allToSync.isNotEmpty) {
+        // Batch isleme - ayni anda max 5 kayit
+        for (int i = 0; i < allToSync.length; i += ApiConfig.maxBatchSize) {
+          final int end = (i + ApiConfig.maxBatchSize < allToSync.length)
+              ? i + ApiConfig.maxBatchSize
+              : allToSync.length;
+          final List<FieldAsset> batch = allToSync.sublist(i, end);
+          final BatchAssetSyncResult batchResult = await _syncAssetBatch(batch);
+          successCount += batchResult.successCount;
+          failedCount += batchResult.failedCount;
+          errors.addAll(batchResult.errors);
+          errorCodes.addAll(batchResult.errorCodes);
+          if (batchResult.serverVersion != null) {
+            currentServerVersion = batchResult.serverVersion;
           }
-        }
         }
       }
 
@@ -161,12 +196,24 @@ class SyncService {
         debugPrint('Senkronize edilecek ariza kaydi sayisi: ${allFaultsToSync.length}');
         for (final FaultRecord fault in allFaultsToSync) {
           try {
-            await _syncSingleFaultRecord(fault);
-            successCount++;
-          } catch (e) {
+            final FaultSyncResult faultResult = await _syncSingleFaultRecord(fault);
+            if (faultResult.isSuccess) {
+              successCount++;
+            } else {
+              failedCount++;
+              errors.add('Ariza (${fault.description}): ${faultResult.errorMessage ?? 'Bilinmeyen hata'}');
+              if (faultResult.errorCode != null) {
+                errorCodes.add(faultResult.errorCode!);
+              }
+            }
+            if (faultResult.serverVersion != null) {
+              currentServerVersion = faultResult.serverVersion;
+            }
+          } catch (err) {
             failedCount++;
-            errors.add('Ariza (${fault.description}): $e');
-            debugPrint('Ariza sync hatasi (${fault.id}): $e');
+            errors.add('Ariza (${fault.description}): $err');
+            errorCodes.add('FAULT_SYNC_EXCEPTION');
+            debugPrint('Ariza sync hatasi (${fault.id}): $err');
           }
         }
       }
@@ -180,42 +227,63 @@ class SyncService {
       successCount: successCount,
       failedCount: failedCount,
       errors: errors,
+      errorCodes: errorCodes,
+      serverVersion: currentServerVersion,
     );
+    _lastServerVersion = currentServerVersion;
     _syncResultController.add(result);
     return result;
   }
 
-  /// Tek bir varligi senkronize et
-  Future<void> _syncSingleAsset(FieldAsset asset) async {
-    String? photoUrl;
-    // 1. Fotograf varsa Firebase Storage'a yukle
-    if (asset.photoLocalPath != null && asset.photoUrl == null) {
-      photoUrl = await _uploadPhotoToFirebase(
-        asset.photoLocalPath!,
-        asset.id,
+  /// Varliklari toplu olarak senkronize et
+  Future<BatchAssetSyncResult> _syncAssetBatch(List<FieldAsset> batch) async {
+    final List<FieldAsset> assetsToSync = [];
+    final Map<String, String> photoUrlsByAssetId = <String, String>{};
+    for (final FieldAsset asset in batch) {
+      String? photoUrl;
+      if (asset.photoLocalPath != null && asset.photoUrl == null) {
+        photoUrl = await _uploadPhotoToFirebase(asset.photoLocalPath!, asset.id);
+      }
+      final FieldAsset updatedAsset = photoUrl != null
+          ? asset.copyWith(photoUrl: photoUrl)
+          : asset;
+      if (photoUrl != null) {
+        photoUrlsByAssetId[asset.id] = photoUrl;
+      }
+      assetsToSync.add(updatedAsset);
+    }
+    final Map<String, dynamic> response = await _apiService.batchAddAssets(assetsToSync);
+    final bool isBatchSuccess = (response['status'] as String?) == 'ok';
+    if (isBatchSuccess) {
+      for (final FieldAsset asset in batch) {
+        await _dbHelper.updateSyncStatus(
+          asset.id,
+          SyncStatus.synced,
+          photoUrl: photoUrlsByAssetId[asset.id],
+        );
+      }
+      return BatchAssetSyncResult(
+        successCount: batch.length,
+        failedCount: 0,
+        serverVersion: response['version'] as int?,
       );
     }
-    // 2. Varlik verisini guncelle (foto URL ekle)
-    final FieldAsset assetToSync = photoUrl != null
-        ? asset.copyWith(photoUrl: photoUrl)
-        : asset;
-    // 3. Backend'e gonder
-    final bool isSuccess = await _apiService.addAsset(assetToSync);
-    if (isSuccess) {
-      // 4. Basarili: sync_status = synced
-      await _dbHelper.updateSyncStatus(
-        asset.id,
-        SyncStatus.synced,
-        photoUrl: photoUrl,
-      );
-    } else {
-      // 5. Basarisiz: retry mekanizmasi
+    for (final FieldAsset asset in batch) {
       await _handleSyncFailure(asset);
     }
+    final String message = (response['message'] as String?) ?? 'Batch sync basarisiz';
+    final String errorCode = (response['error_code'] as String?) ?? 'BATCH_SYNC_FAILED';
+    return BatchAssetSyncResult(
+      successCount: 0,
+      failedCount: batch.length,
+      errors: <String>['Batch sync hatasi: $message'],
+      errorCodes: <String>[errorCode],
+      serverVersion: response['version'] as int?,
+    );
   }
 
   /// Tek bir ariza kaydini senkronize et
-  Future<void> _syncSingleFaultRecord(FaultRecord fault) async {
+  Future<FaultSyncResult> _syncSingleFaultRecord(FaultRecord fault) async {
     String? photoUrl;
     // 1. Fotograf varsa Firebase Storage'a yukle
     if (fault.photoLocalPath != null && fault.photoUrl == null) {
@@ -231,7 +299,19 @@ class SyncService {
         : fault;
 
     // 3. Backend'e gonder
-    final bool isSuccess = await _apiService.addFaultRecord(faultToSync);
+    final Map<String, dynamic> response = faultToSync.status == 'resolved'
+        ? await _apiService.resolveFaultRecord(faultToSync)
+        : await _apiService.addFaultRecord(faultToSync);
+    bool isSuccess = (response['status'] as String?) == 'ok';
+    if (!isSuccess &&
+        faultToSync.status == 'resolved' &&
+        (response['error_code'] as String?) == 'HTTP_404') {
+      final Map<String, dynamic> fallbackResponse = await _apiService.addFaultRecord(faultToSync);
+      isSuccess = (fallbackResponse['status'] as String?) == 'ok';
+      if (isSuccess) {
+        response.addAll(fallbackResponse);
+      }
+    }
 
     if (isSuccess) {
       // 4. Basarili: sync_status = synced
@@ -240,12 +320,22 @@ class SyncService {
         SyncStatus.synced,
         photoUrl: photoUrl,
       );
+      return FaultSyncResult(
+        isSuccess: true,
+        serverVersion: response['version'] as int?,
+      );
     } else {
       // 5. Basarisiz: Basitce syncFailed olarak isaretle
       // (Ileride gelismis retry kuyrugu eklenebilir)
       await _dbHelper.updateFaultSyncStatus(
         fault.id,
         SyncStatus.syncFailed,
+      );
+      return FaultSyncResult(
+        isSuccess: false,
+        errorCode: (response['error_code'] as String?) ?? 'FAULT_SYNC_FAILED',
+        errorMessage: response['message'] as String?,
+        serverVersion: response['version'] as int?,
       );
     }
   }

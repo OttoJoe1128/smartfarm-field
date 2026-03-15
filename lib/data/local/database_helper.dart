@@ -21,7 +21,6 @@ class DatabaseHelper {
   // Tablo adlari
   static const String tableFieldAssets = 'field_assets';
   static const String tableSyncQueue = 'sync_queue';
-  static const String tableSyncQueue = 'sync_queue';
   static const String tableFaultRecords = 'fault_records';
   static const String tableParcels = 'parcels';
 

@@ -7,6 +7,34 @@ import '../models/field_asset.dart';
 import '../models/fault_record.dart';
 import '../models/parcel.dart';
 
+/// Standart API yanit modeli
+class ApiYanit {
+  final bool isSuccess;
+  final String status;
+  final String? errorCode;
+  final String? message;
+  final int? version;
+  final dynamic data;
+  const ApiYanit({
+    required this.isSuccess,
+    required this.status,
+    this.errorCode,
+    this.message,
+    this.version,
+    this.data,
+  });
+  Map<String, dynamic> toMap() {
+    return {
+      'is_success': isSuccess,
+      'status': status,
+      'error_code': errorCode,
+      'message': message,
+      'version': version,
+      'data': data,
+    };
+  }
+}
+
 /// Saha uygulamasi Backend API istemcisi
 /// Mevcut auth sistemi ile uyumlu JWT tabanli iletisim
 class SahaApiService {
@@ -17,8 +45,8 @@ class SahaApiService {
     debugPrint('SahaApiService: Backend URL = $resolvedUrl');
     _dio = Dio(BaseOptions(
       baseUrl: resolvedUrl,
-      connectTimeout: Duration(seconds: ApiConfig.connectTimeoutSeconds),
-      receiveTimeout: Duration(seconds: ApiConfig.receiveTimeoutSeconds),
+      connectTimeout: const Duration(seconds: ApiConfig.connectTimeoutSeconds),
+      receiveTimeout: const Duration(seconds: ApiConfig.receiveTimeoutSeconds),
       headers: {'Content-Type': 'application/json'},
     ));
     _dio.interceptors.add(InterceptorsWrapper(
@@ -120,7 +148,8 @@ class SahaApiService {
         '/gis/add-asset',
         data: asset.toApiPayload(),
       );
-      return response.statusCode == 200;
+      final ApiYanit apiYanit = _parseApiYanit(response);
+      return apiYanit.isSuccess;
     } catch (e) {
       debugPrint('Asset ekleme hatasi: $e');
       return false;
@@ -136,10 +165,10 @@ class SahaApiService {
         '/gis/batch-add-assets',
         data: {'assets': payloads},
       );
-      return response.data as Map<String, dynamic>;
+      return _parseApiYanit(response).toMap();
     } catch (e) {
       debugPrint('Batch asset ekleme hatasi: $e');
-      return {'status': 'error', 'message': e.toString()};
+      return _buildErrorYanit(error: e, fallbackCode: 'BATCH_SYNC_ERROR').toMap();
     }
   }
 
@@ -157,7 +186,17 @@ class SahaApiService {
         '/gis/upload-photo',
         data: formData,
       );
-      return (response.data as Map<String, dynamic>)['url'] as String?;
+      final ApiYanit apiYanit = _parseApiYanit(response);
+      if (!apiYanit.isSuccess) {
+        return null;
+      }
+      if (apiYanit.data is Map<String, dynamic>) {
+        return (apiYanit.data as Map<String, dynamic>)['url'] as String?;
+      }
+      if (response.data is Map<String, dynamic>) {
+        return (response.data as Map<String, dynamic>)['url'] as String?;
+      }
+      return null;
     } catch (e) {
       debugPrint('Fotograf yukleme hatasi: $e');
       return null;
@@ -178,17 +217,38 @@ class SahaApiService {
   // --- Fault Reporting ---
 
   /// Ariza kaydi olustur
-  Future<bool> addFaultRecord(FaultRecord fault) async {
+  Future<Map<String, dynamic>> addFaultRecord(FaultRecord fault) async {
     try {
       final Response<dynamic> response = await _dio.post(
         '/gis/add-fault',
         data: fault.toApiPayload(),
       );
-      return response.statusCode == 200;
+      return _parseApiYanit(response).toMap();
     } catch (e) {
       debugPrint('Ariza kaydi ekleme hatasi: $e');
-      return false;
+      return _buildErrorYanit(error: e, fallbackCode: 'ADD_FAULT_ERROR').toMap();
     }
+  }
+
+  /// Ariza kaydini cozuldu olarak isaretle
+  Future<Map<String, dynamic>> resolveFaultRecord(FaultRecord fault) async {
+    try {
+      final Response<dynamic> response = await _dio.post(
+        '/gis/resolve-fault',
+        data: {
+          'fault_id': fault.id,
+          'asset_id': fault.assetId,
+          'status': 'resolved',
+          'resolved_at': (fault.resolvedAt ?? DateTime.now()).toIso8601String(),
+        },
+      );
+      return _parseApiYanit(response).toMap();
+    } catch (e) {
+      debugPrint('Ariza cozme hatasi: $e');
+      return _buildErrorYanit(
+        error: e,
+        fallbackCode: 'RESOLVE_FAULT_ERROR',
+      ).toMap();
     }
   }
 
@@ -204,5 +264,68 @@ class SahaApiService {
       debugPrint('Parsel verisi alma hatasi: $e');
       return [];
     }
+  }
+
+  ApiYanit _parseApiYanit(Response<dynamic> response) {
+    final int statusCode = response.statusCode ?? 0;
+    final bool isHttpSuccess = statusCode >= 200 && statusCode < 300;
+    final dynamic body = response.data;
+    if (body is Map<String, dynamic>) {
+      final String statusText = (body['status'] as String?) ?? (isHttpSuccess ? 'ok' : 'error');
+      final String? errorCodeText = (body['error_code'] as String?) ?? (body['code'] as String?);
+      final String? messageText = body['message'] as String?;
+      final int? versionValue = body['version'] is int ? body['version'] as int : null;
+      final dynamic dataNode = body.containsKey('data') ? body['data'] : body;
+      return ApiYanit(
+        isSuccess: statusText == 'ok' && isHttpSuccess,
+        status: statusText,
+        errorCode: errorCodeText,
+        message: messageText,
+        version: versionValue,
+        data: dataNode,
+      );
+    }
+    if (body is List) {
+      return ApiYanit(
+        isSuccess: isHttpSuccess,
+        status: isHttpSuccess ? 'ok' : 'error',
+        version: null,
+        data: body,
+      );
+    }
+    return ApiYanit(
+      isSuccess: isHttpSuccess,
+      status: isHttpSuccess ? 'ok' : 'error',
+      version: null,
+      data: body,
+    );
+  }
+
+  ApiYanit _buildErrorYanit({
+    required Object error,
+    required String fallbackCode,
+  }) {
+    if (error is DioException) {
+      final int statusCode = error.response?.statusCode ?? 0;
+      String? errorCodeText;
+      String? messageText;
+      final dynamic body = error.response?.data;
+      if (body is Map<String, dynamic>) {
+        errorCodeText = (body['error_code'] as String?) ?? (body['code'] as String?);
+        messageText = body['message'] as String?;
+      }
+      return ApiYanit(
+        isSuccess: false,
+        status: 'error',
+        errorCode: errorCodeText ?? (statusCode > 0 ? 'HTTP_$statusCode' : fallbackCode),
+        message: messageText ?? error.message,
+      );
+    }
+    return ApiYanit(
+      isSuccess: false,
+      status: 'error',
+      errorCode: fallbackCode,
+      message: error.toString(),
+    );
   }
 }
