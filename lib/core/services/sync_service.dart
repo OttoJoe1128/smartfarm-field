@@ -59,6 +59,24 @@ class FaultSyncResult {
   });
 }
 
+/// Canli event projection durumu
+class LiveProjectionState {
+  final bool isConnected;
+  final int reconnectAttempt;
+  final int alertCount;
+  final DateTime? lastEventAt;
+  final String? lastEventType;
+  final Map<String, Map<String, dynamic>> telemetryByAssetId;
+  const LiveProjectionState({
+    required this.isConnected,
+    required this.reconnectAttempt,
+    required this.alertCount,
+    this.lastEventAt,
+    this.lastEventType,
+    this.telemetryByAssetId = const <String, Map<String, dynamic>>{},
+  });
+}
+
 /// Offline-first senkronizasyon motoru
 /// Baglanti durumunu dinler, toplu senkronizasyon yapar, hata yonetimi saglar
 class SyncService {
@@ -72,11 +90,19 @@ class SyncService {
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   Timer? _autoSyncTimer;
+  Timer? _liveReconnectTimer;
   WebSocket? _liveWebSocket;
   bool _isSyncing = false;
   bool _isAutoSyncEnabled = false;
   bool _isLiveStreamActive = false;
+  bool _shouldKeepLiveStream = false;
   int? _lastServerVersion;
+  int _liveReconnectAttempt = 0;
+  DateTime? _lastLiveEventAt;
+  String? _lastLiveEventType;
+  final List<Map<String, dynamic>> _liveAlerts = <Map<String, dynamic>>[];
+  final Map<String, Map<String, dynamic>> _telemetryByAssetId =
+      <String, Map<String, dynamic>>{};
   int? get lastServerVersion => _lastServerVersion;
   bool get isLiveStreamActive => _isLiveStreamActive;
 
@@ -87,6 +113,20 @@ class SyncService {
   final StreamController<Map<String, dynamic>> _liveEventController =
       StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get liveEventStream => _liveEventController.stream;
+  final StreamController<LiveProjectionState> _liveProjectionController =
+      StreamController<LiveProjectionState>.broadcast();
+  Stream<LiveProjectionState> get liveProjectionStream =>
+      _liveProjectionController.stream;
+  LiveProjectionState get liveProjectionSnapshot => LiveProjectionState(
+        isConnected: _isLiveStreamActive,
+        reconnectAttempt: _liveReconnectAttempt,
+        alertCount: _liveAlerts.length,
+        lastEventAt: _lastLiveEventAt,
+        lastEventType: _lastLiveEventType,
+        telemetryByAssetId: Map<String, Map<String, dynamic>>.from(
+          _telemetryByAssetId,
+        ),
+      );
 
   /// Otomatik senkronizasyonu baslat
   void startAutoSync() {
@@ -412,6 +452,7 @@ class SyncService {
     stopLiveEventStream();
     _syncResultController.close();
     _liveEventController.close();
+    _liveProjectionController.close();
   }
 
   /// Faz 3 icin onboarding ve kontrat metadata hazirligi
@@ -450,16 +491,39 @@ class SyncService {
     if (_isLiveStreamActive) {
       return;
     }
+    _shouldKeepLiveStream = true;
+    _liveReconnectTimer?.cancel();
+    _liveReconnectTimer = null;
+    _liveReconnectAttempt = 0;
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     final String? accessToken = prefs.getString('access_token');
     if (accessToken == null || accessToken.isEmpty) {
-      _liveEventController.add({
+      final Map<String, dynamic> errorEvent = {
         'type': 'error',
         'error_code': 'MISSING_ACCESS_TOKEN',
         'message': 'Canli stream icin access token bulunamadi',
-      });
+      };
+      _liveEventController.add(errorEvent);
+      _processLiveEvent(errorEvent);
       return;
     }
+    await _connectLiveStream(accessToken);
+  }
+
+  /// Canli veri WebSocket baglantisini durdur
+  Future<void> stopLiveEventStream() async {
+    _shouldKeepLiveStream = false;
+    _liveReconnectTimer?.cancel();
+    _liveReconnectTimer = null;
+    if (_liveWebSocket != null) {
+      await _liveWebSocket!.close();
+      _liveWebSocket = null;
+    }
+    _isLiveStreamActive = false;
+    _emitLiveProjection();
+  }
+
+  Future<void> _connectLiveStream(String accessToken) async {
     final String wsUrl = _apiService.buildLiveWebSocketUrl();
     try {
       _liveWebSocket = await WebSocket.connect(
@@ -467,44 +531,143 @@ class SyncService {
         headers: <String, dynamic>{'Authorization': 'Bearer $accessToken'},
       );
       _isLiveStreamActive = true;
+      _liveReconnectAttempt = 0;
+      _emitLiveProjection();
       _liveWebSocket!.listen(
         (dynamic rawEvent) {
-          if (rawEvent is String) {
+          if (rawEvent is! String) {
+            return;
+          }
+          try {
             final dynamic decoded = jsonDecode(rawEvent);
             if (decoded is Map<String, dynamic>) {
               _liveEventController.add(decoded);
+              _processLiveEvent(decoded);
             }
+          } catch (_) {
+            final Map<String, dynamic> errorEvent = {
+              'type': 'error',
+              'error_code': 'LIVE_STREAM_DECODE_ERROR',
+              'message': 'Canli event decode edilemedi',
+            };
+            _liveEventController.add(errorEvent);
+            _processLiveEvent(errorEvent);
           }
         },
         onDone: () {
           _isLiveStreamActive = false;
+          _emitLiveProjection();
+          _scheduleLiveReconnect();
         },
         onError: (Object err) {
           _isLiveStreamActive = false;
-          _liveEventController.add({
+          final Map<String, dynamic> errorEvent = {
             'type': 'error',
             'error_code': 'LIVE_STREAM_ERROR',
             'message': err.toString(),
-          });
+          };
+          _liveEventController.add(errorEvent);
+          _processLiveEvent(errorEvent);
+          _scheduleLiveReconnect();
         },
-        cancelOnError: false,
+        cancelOnError: true,
       );
     } catch (e) {
       _isLiveStreamActive = false;
-      _liveEventController.add({
+      final Map<String, dynamic> errorEvent = {
         'type': 'error',
         'error_code': 'LIVE_STREAM_CONNECT_FAILED',
         'message': e.toString(),
-      });
+      };
+      _liveEventController.add(errorEvent);
+      _processLiveEvent(errorEvent);
+      _scheduleLiveReconnect();
     }
   }
 
-  /// Canli veri WebSocket baglantisini durdur
-  Future<void> stopLiveEventStream() async {
-    if (_liveWebSocket != null) {
-      await _liveWebSocket!.close();
-      _liveWebSocket = null;
+  void _scheduleLiveReconnect() {
+    if (!_shouldKeepLiveStream) {
+      return;
     }
-    _isLiveStreamActive = false;
+    _liveReconnectTimer?.cancel();
+    _liveReconnectAttempt += 1;
+    final int waitSeconds = _calculateReconnectDelaySeconds(_liveReconnectAttempt);
+    _emitLiveProjection();
+    _liveReconnectTimer = Timer(Duration(seconds: waitSeconds), () async {
+      final SharedPreferences prefs = await SharedPreferences.getInstance();
+      final String? accessToken = prefs.getString('access_token');
+      if (accessToken == null || accessToken.isEmpty) {
+        return;
+      }
+      await _connectLiveStream(accessToken);
+    });
+  }
+
+  int _calculateReconnectDelaySeconds(int attempt) {
+    if (attempt <= 1) {
+      return 2;
+    }
+    if (attempt == 2) {
+      return 4;
+    }
+    if (attempt == 3) {
+      return 8;
+    }
+    if (attempt == 4) {
+      return 16;
+    }
+    return 30;
+  }
+
+  void _processLiveEvent(Map<String, dynamic> eventPayload) {
+    _lastLiveEventAt = DateTime.now();
+    _lastLiveEventType = eventPayload['type'] as String?;
+    final String eventType = _lastLiveEventType ?? '';
+    if (eventType == 'telemetry') {
+      final String assetId = (eventPayload['asset_id'] as String?) ?? '';
+      if (assetId.isNotEmpty) {
+        final Map<String, dynamic> telemetryNode = {
+          'asset_id': assetId,
+          'device_id': eventPayload['device_id'],
+          'metrics': eventPayload['metrics'],
+          'measured_at': eventPayload['measured_at'],
+          'received_at': _lastLiveEventAt?.toIso8601String(),
+        };
+        _telemetryByAssetId[assetId] = telemetryNode;
+      }
+      final dynamic alertsNode = eventPayload['alerts'];
+      if (alertsNode is List) {
+        for (final dynamic alertItem in alertsNode) {
+          if (alertItem is Map<String, dynamic>) {
+            _liveAlerts.add(Map<String, dynamic>.from(alertItem));
+          }
+        }
+        if (_liveAlerts.length > 200) {
+          _liveAlerts.removeRange(0, _liveAlerts.length - 200);
+        }
+      }
+    }
+    if (eventType == 'error') {
+      _isLiveStreamActive = false;
+    }
+    _emitLiveProjection();
+  }
+
+  void _emitLiveProjection() {
+    if (_liveProjectionController.isClosed) {
+      return;
+    }
+    _liveProjectionController.add(
+      LiveProjectionState(
+        isConnected: _isLiveStreamActive,
+        reconnectAttempt: _liveReconnectAttempt,
+        alertCount: _liveAlerts.length,
+        lastEventAt: _lastLiveEventAt,
+        lastEventType: _lastLiveEventType,
+        telemetryByAssetId: Map<String, Map<String, dynamic>>.from(
+          _telemetryByAssetId,
+        ),
+      ),
+    );
   }
 }

@@ -30,28 +30,60 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
   final GpsService _gpsService = GpsService();
   final DatabaseHelper _dbHelper = DatabaseHelper();
   final MapController _mapController = MapController();
+  final SyncService _syncService = SyncService();
 
   GpsPosition? _currentPosition;
   List<FieldAsset> _assets = [];
   List<Parcel> _parcels = [];
   int _pendingSyncCount = 0;
+  int _liveAlertCount = 0;
+  bool _isLiveConnected = false;
+  int _liveReconnectAttempt = 0;
+  String? _lastLiveEventType;
+  DateTime? _lastLiveEventAt;
   String _selectedAssetType = AssetType.agac;
   bool _isGpsActive = false;
   int _currentNavIndex = 0;
   StreamSubscription<GpsPosition>? _gpsSubscription;
+  StreamSubscription<LiveProjectionState>? _liveProjectionSubscription;
 
   @override
   void initState() {
     super.initState();
     _initializeGps();
     _loadAssets();
+    _bindLiveProjection();
   }
 
   @override
   void dispose() {
     _gpsSubscription?.cancel();
+    _liveProjectionSubscription?.cancel();
     _gpsService.dispose();
     super.dispose();
+  }
+
+  void _bindLiveProjection() {
+    final LiveProjectionState snapshot = _syncService.liveProjectionSnapshot;
+    _liveAlertCount = snapshot.alertCount;
+    _isLiveConnected = snapshot.isConnected;
+    _liveReconnectAttempt = snapshot.reconnectAttempt;
+    _lastLiveEventType = snapshot.lastEventType;
+    _lastLiveEventAt = snapshot.lastEventAt;
+    _liveProjectionSubscription = _syncService.liveProjectionStream.listen(
+      (LiveProjectionState state) {
+        if (!mounted) {
+          return;
+        }
+        setState(() {
+          _liveAlertCount = state.alertCount;
+          _isLiveConnected = state.isConnected;
+          _liveReconnectAttempt = state.reconnectAttempt;
+          _lastLiveEventType = state.lastEventType;
+          _lastLiveEventAt = state.lastEventAt;
+        });
+      },
+    );
   }
 
   Future<void> _initializeGps() async {
@@ -552,6 +584,35 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
               ],
             ),
           ),
+          const SizedBox(width: 8),
+          // Canli alarm bagde butonu
+          Container(
+            decoration: BoxDecoration(
+              color: FieldTheme.backgroundWhite,
+              borderRadius: BorderRadius.circular(12),
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.15),
+                  blurRadius: 8,
+                  offset: const Offset(0, 2),
+                ),
+              ],
+            ),
+            child: IconButton(
+              onPressed: () => _showLiveStatusSheet(),
+              icon: Badge(
+                isLabelVisible: _liveAlertCount > 0,
+                label: Text(
+                  '$_liveAlertCount',
+                  style: const TextStyle(fontSize: 10),
+                ),
+                child: Icon(
+                  _isLiveConnected ? Icons.notifications_active : Icons.notifications_off,
+                  color: _isLiveConnected ? FieldTheme.primaryGreen : FieldTheme.errorRed,
+                ),
+              ),
+            ),
+          ),
           const Spacer(),
           // Konuma git butonu
           Container(
@@ -719,5 +780,57 @@ class _SahaHaritaSayfasiState extends State<SahaHaritaSayfasi> {
       case GpsAccuracyLevel.poor:
         return FieldTheme.gpsPoor;
     }
+  }
+
+  void _showLiveStatusSheet() {
+    final String reconnectText = _isLiveConnected
+        ? 'Bagli'
+        : _liveReconnectAttempt > 0
+            ? 'Yeniden baglaniyor ($_liveReconnectAttempt)'
+            : 'Bagli degil';
+    final String lastEventText = _lastLiveEventAt == null
+        ? 'Yok'
+        : '${_lastLiveEventAt!.hour.toString().padLeft(2, '0')}:'
+            '${_lastLiveEventAt!.minute.toString().padLeft(2, '0')}:'
+            '${_lastLiveEventAt!.second.toString().padLeft(2, '0')}';
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (BuildContext context) {
+        return Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                'Canli Veri Durumu',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 12),
+              Text('Baglanti: $reconnectText'),
+              Text('Alarm sayisi: $_liveAlertCount'),
+              Text('Son event tipi: ${_lastLiveEventType ?? 'Yok'}'),
+              Text('Son event zamani: $lastEventText'),
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  ElevatedButton.icon(
+                    onPressed: () => _syncService.startLiveEventStream(),
+                    icon: const Icon(Icons.wifi_tethering),
+                    label: const Text('Yeniden Baglan'),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton.icon(
+                    onPressed: () => _syncService.stopLiveEventStream(),
+                    icon: const Icon(Icons.stop_circle_outlined),
+                    label: const Text('Durdur'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        );
+      },
+    );
   }
 }
