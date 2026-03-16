@@ -237,6 +237,131 @@ class SahaApiService {
     return '$wsUrl/ws/live';
   }
 
+  /// IoT cihaz kaydi olustur (onboarding)
+  Future<Map<String, dynamic>> registerIotDevice({
+    required String assetId,
+    required String deviceId,
+    String model = '',
+    String firmwareVersion = '',
+  }) async {
+    try {
+      final Response<dynamic> response = await _dio.post(
+        '/iot/devices/register',
+        data: {
+          'asset_id': assetId,
+          'device_id': deviceId,
+          'model': model,
+          'firmware_version': firmwareVersion,
+        },
+      );
+      return _parseApiYanit(response).toMap();
+    } catch (e) {
+      debugPrint('IoT cihaz kayit hatasi: $e');
+      return _buildErrorYanit(
+        error: e,
+        fallbackCode: 'IOT_DEVICE_REGISTER_ERROR',
+      ).toMap();
+    }
+  }
+
+  /// IoT cihaz anahtarini yenile
+  Future<Map<String, dynamic>> rotateIotDeviceKey(String deviceId) async {
+    try {
+      final Response<dynamic> response = await _dio.post(
+        '/iot/devices/$deviceId/rotate-key',
+      );
+      return _parseApiYanit(response).toMap();
+    } catch (e) {
+      debugPrint('IoT key rotate hatasi: $e');
+      return _buildErrorYanit(
+        error: e,
+        fallbackCode: 'IOT_DEVICE_ROTATE_KEY_ERROR',
+      ).toMap();
+    }
+  }
+
+  /// Aktif alarmlari getir
+  Future<Map<String, dynamic>> listIotAlerts() async {
+    try {
+      final Response<dynamic> response = await _dio.get('/iot/alerts');
+      return _parseApiYanit(response).toMap();
+    } catch (e) {
+      debugPrint('IoT alert listeleme hatasi: $e');
+      return _buildErrorYanit(
+        error: e,
+        fallbackCode: 'IOT_ALERT_LIST_ERROR',
+      ).toMap();
+    }
+  }
+
+  /// Alarm ack islemi
+  Future<Map<String, dynamic>> ackIotAlert({
+    required String alertId,
+    required String operator,
+  }) async {
+    try {
+      final Response<dynamic> response = await _dio.patch(
+        '/iot/alerts/$alertId/ack',
+        data: {'operator': operator},
+      );
+      return _parseApiYanit(response).toMap();
+    } catch (e) {
+      debugPrint('IoT alert ack hatasi: $e');
+      return _buildErrorYanit(
+        error: e,
+        fallbackCode: 'IOT_ALERT_ACK_ERROR',
+      ).toMap();
+    }
+  }
+
+  /// Alarm close islemi
+  Future<Map<String, dynamic>> closeIotAlert({
+    required String alertId,
+    required String operator,
+    required String reason,
+  }) async {
+    try {
+      final Response<dynamic> response = await _dio.patch(
+        '/iot/alerts/$alertId/close',
+        data: {'operator': operator, 'reason': reason},
+      );
+      return _parseApiYanit(response).toMap();
+    } catch (e) {
+      debugPrint('IoT alert close hatasi: $e');
+      return _buildErrorYanit(
+        error: e,
+        fallbackCode: 'IOT_ALERT_CLOSE_ERROR',
+      ).toMap();
+    }
+  }
+
+  /// Telemetry ingest (E2E ve saha cihaz akisi)
+  Future<Map<String, dynamic>> ingestTelemetry({
+    required String assetId,
+    required String deviceId,
+    required Map<String, dynamic> metrics,
+    String? measuredAt,
+  }) async {
+    try {
+      final Response<dynamic> response = await _dio.post(
+        '/iot/telemetry',
+        data: {
+          'asset_id': assetId,
+          'device_id': deviceId,
+          'metrics': metrics,
+          'measured_at': measuredAt ?? DateTime.now().toIso8601String(),
+        },
+      );
+      return _parseApiYanit(response).toMap();
+    } catch (e) {
+      debugPrint('IoT telemetry ingest hatasi: $e');
+      return _buildErrorYanit(
+        error: e,
+        fallbackCode: 'IOT_TELEMETRY_INGEST_ERROR',
+      ).toMap();
+    }
+  }
+
   // --- Fault Reporting ---
 
   /// Ariza kaydi olustur

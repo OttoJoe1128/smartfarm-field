@@ -79,6 +79,24 @@ class LiveProjectionState {
   });
 }
 
+/// Faz 3 onboarding durumu
+class OnboardingState {
+  final String deviceId;
+  final String? telemetryPublishTopic;
+  final String? commandSubscribeTopic;
+  final String? apiKeyMasked;
+  final int? wsHeartbeatTimeoutSeconds;
+  final String? wsSchemaVersion;
+  const OnboardingState({
+    required this.deviceId,
+    this.telemetryPublishTopic,
+    this.commandSubscribeTopic,
+    this.apiKeyMasked,
+    this.wsHeartbeatTimeoutSeconds,
+    this.wsSchemaVersion,
+  });
+}
+
 /// Offline-first senkronizasyon motoru
 /// Baglanti durumunu dinler, toplu senkronizasyon yapar, hata yonetimi saglar
 class SyncService {
@@ -93,6 +111,7 @@ class SyncService {
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
   Timer? _autoSyncTimer;
   Timer? _liveReconnectTimer;
+  Timer? _wsHeartbeatPingTimer;
   WebSocket? _liveWebSocket;
   bool _isSyncing = false;
   bool _isAutoSyncEnabled = false;
@@ -102,12 +121,18 @@ class SyncService {
   int _liveReconnectAttempt = 0;
   DateTime? _lastLiveEventAt;
   String? _lastLiveEventType;
+  String _wsSchemaVersion = 'ws.live.telemetry.v1';
+  int _wsHeartbeatTimeoutSeconds = 30;
+  String? _wsReconnectHint;
   final List<Map<String, dynamic>> _liveAlerts = <Map<String, dynamic>>[];
   final Map<String, Map<String, dynamic>> _telemetryByAssetId =
       <String, Map<String, dynamic>>{};
   final Map<String, int> _alertCountByAssetId = <String, int>{};
   int? get lastServerVersion => _lastServerVersion;
   bool get isLiveStreamActive => _isLiveStreamActive;
+  String get wsSchemaVersion => _wsSchemaVersion;
+  int get wsHeartbeatTimeoutSeconds => _wsHeartbeatTimeoutSeconds;
+  String? get wsReconnectHint => _wsReconnectHint;
 
   /// Senkronizasyon durumu akisi
   final StreamController<SyncResult> _syncResultController =
@@ -477,8 +502,18 @@ class SyncService {
       };
     }
     final int? versionValue = contractResponse['version'] as int?;
+    final Map<String, dynamic> contractData = _extractContractData(contractResponse);
+    final Map<String, dynamic> wsSchema =
+        (contractData['ws_live_schema'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    _wsSchemaVersion = (wsSchema['version'] as String?) ?? _wsSchemaVersion;
+    _wsHeartbeatTimeoutSeconds =
+        (wsSchema['heartbeat_timeout_seconds'] as int?) ?? _wsHeartbeatTimeoutSeconds;
+    _wsReconnectHint = wsSchema['reconnect_hint'] as String? ?? _wsReconnectHint;
     _lastServerVersion = versionValue ?? _lastServerVersion;
     await prefs.setString('field_ws_url', _apiService.buildLiveWebSocketUrl());
+    await prefs.setString('field_ws_schema_version', _wsSchemaVersion);
+    await prefs.setInt('field_ws_heartbeat_timeout', _wsHeartbeatTimeoutSeconds);
+    await prefs.setString('field_ws_reconnect_hint', _wsReconnectHint ?? '');
     if (versionValue != null) {
       await prefs.setInt('field_server_version', versionValue);
     }
@@ -487,6 +522,9 @@ class SyncService {
       'device_id': deviceId,
       'server_version': _lastServerVersion,
       'ws_url': _apiService.buildLiveWebSocketUrl(),
+      'ws_schema_version': _wsSchemaVersion,
+      'ws_heartbeat_timeout_seconds': _wsHeartbeatTimeoutSeconds,
+      'ws_reconnect_hint': _wsReconnectHint,
     };
   }
 
@@ -519,6 +557,8 @@ class SyncService {
     _shouldKeepLiveStream = false;
     _liveReconnectTimer?.cancel();
     _liveReconnectTimer = null;
+    _wsHeartbeatPingTimer?.cancel();
+    _wsHeartbeatPingTimer = null;
     if (_liveWebSocket != null) {
       await _liveWebSocket!.close();
       _liveWebSocket = null;
@@ -537,6 +577,7 @@ class SyncService {
       _isLiveStreamActive = true;
       _liveReconnectAttempt = 0;
       _emitLiveProjection();
+      _startHeartbeatPingLoop();
       _liveWebSocket!.listen(
         (dynamic rawEvent) {
           if (rawEvent is! String) {
@@ -560,11 +601,15 @@ class SyncService {
         },
         onDone: () {
           _isLiveStreamActive = false;
+          _wsHeartbeatPingTimer?.cancel();
+          _wsHeartbeatPingTimer = null;
           _emitLiveProjection();
           _scheduleLiveReconnect();
         },
         onError: (Object err) {
           _isLiveStreamActive = false;
+          _wsHeartbeatPingTimer?.cancel();
+          _wsHeartbeatPingTimer = null;
           final Map<String, dynamic> errorEvent = {
             'type': 'error',
             'error_code': 'LIVE_STREAM_ERROR',
@@ -661,6 +706,21 @@ class SyncService {
     if (eventType == 'error') {
       _isLiveStreamActive = false;
     }
+    if (eventType == 'schema_mismatch') {
+      _isLiveStreamActive = false;
+      _shouldKeepLiveStream = false;
+      _wsHeartbeatPingTimer?.cancel();
+      _wsHeartbeatPingTimer = null;
+      _liveReconnectTimer?.cancel();
+      _liveReconnectTimer = null;
+      _wsReconnectHint = eventPayload['reconnect_hint'] as String? ?? _wsReconnectHint;
+    }
+    if (eventType == 'heartbeat_timeout') {
+      _isLiveStreamActive = false;
+      _wsHeartbeatPingTimer?.cancel();
+      _wsHeartbeatPingTimer = null;
+      _wsReconnectHint = eventPayload['reconnect_hint'] as String? ?? _wsReconnectHint;
+    }
     _emitLiveProjection();
   }
 
@@ -681,5 +741,202 @@ class SyncService {
         alertCountByAssetId: Map<String, int>.from(_alertCountByAssetId),
       ),
     );
+  }
+
+  void _startHeartbeatPingLoop() {
+    _wsHeartbeatPingTimer?.cancel();
+    _wsHeartbeatPingTimer = null;
+    if (_liveWebSocket == null || !_isLiveStreamActive) {
+      return;
+    }
+    final int pingIntervalSeconds = (_wsHeartbeatTimeoutSeconds / 2).floor();
+    final int safeInterval = pingIntervalSeconds < 3 ? 3 : pingIntervalSeconds;
+    _wsHeartbeatPingTimer = Timer.periodic(
+      Duration(seconds: safeInterval),
+      (_) async {
+        if (_liveWebSocket == null || !_isLiveStreamActive) {
+          return;
+        }
+        final Map<String, dynamic> pingPayload = {
+          'type': 'ping',
+          'schema_version': _wsSchemaVersion,
+          'sent_at': DateTime.now().toIso8601String(),
+        };
+        try {
+          _liveWebSocket!.add(jsonEncode(pingPayload));
+        } catch (e) {
+          final Map<String, dynamic> errorEvent = {
+            'type': 'error',
+            'error_code': 'LIVE_STREAM_PING_FAILED',
+            'message': e.toString(),
+          };
+          _liveEventController.add(errorEvent);
+          _processLiveEvent(errorEvent);
+        }
+      },
+    );
+  }
+
+  Map<String, dynamic> _extractContractData(Map<String, dynamic> contractResponse) {
+    final dynamic dataNode = contractResponse['data'];
+    if (dataNode is Map<String, dynamic>) {
+      return dataNode;
+    }
+    return contractResponse;
+  }
+
+  Future<OnboardingState> registerOrRefreshDevice({
+    required String assetId,
+    String model = 'field-mobile',
+    String firmwareVersion = 'phase3',
+  }) async {
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    String? deviceId = prefs.getString('field_device_id');
+    if (deviceId == null || deviceId.isEmpty) {
+      deviceId = const Uuid().v4();
+      await prefs.setString('field_device_id', deviceId);
+    }
+    final Map<String, dynamic> response = await _apiService.registerIotDevice(
+      assetId: assetId,
+      deviceId: deviceId,
+      model: model,
+      firmwareVersion: firmwareVersion,
+    );
+    final Map<String, dynamic> dataNode =
+        (response['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final Map<String, dynamic> deviceNode =
+        (dataNode['device'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final Map<String, dynamic> topicPolicy =
+        (deviceNode['topic_policy'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final String? rawApiKey = deviceNode['api_key'] as String?;
+    final String? apiKeyMasked = rawApiKey == null || rawApiKey.length < 8
+        ? rawApiKey
+        : '${rawApiKey.substring(0, 4)}***${rawApiKey.substring(rawApiKey.length - 4)}';
+    return OnboardingState(
+      deviceId: (deviceNode['device_id'] as String?) ?? deviceId,
+      telemetryPublishTopic: topicPolicy['telemetry_publish_topic'] as String?,
+      commandSubscribeTopic: topicPolicy['command_subscribe_topic'] as String?,
+      apiKeyMasked: apiKeyMasked,
+      wsHeartbeatTimeoutSeconds: _wsHeartbeatTimeoutSeconds,
+      wsSchemaVersion: _wsSchemaVersion,
+    );
+  }
+
+  Future<OnboardingState> rotateDeviceKey() async {
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    final String? deviceId = prefs.getString('field_device_id');
+    if (deviceId == null || deviceId.isEmpty) {
+      throw StateError('Cihaz id bulunamadi');
+    }
+    final Map<String, dynamic> response = await _apiService.rotateIotDeviceKey(deviceId);
+    final Map<String, dynamic> dataNode =
+        (response['data'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final Map<String, dynamic> deviceNode =
+        (dataNode['device'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final Map<String, dynamic> topicPolicy =
+        (deviceNode['topic_policy'] as Map<String, dynamic>?) ?? <String, dynamic>{};
+    final String? rawApiKey = deviceNode['api_key'] as String?;
+    final String? apiKeyMasked = rawApiKey == null || rawApiKey.length < 8
+        ? rawApiKey
+        : '${rawApiKey.substring(0, 4)}***${rawApiKey.substring(rawApiKey.length - 4)}';
+    return OnboardingState(
+      deviceId: (deviceNode['device_id'] as String?) ?? deviceId,
+      telemetryPublishTopic: topicPolicy['telemetry_publish_topic'] as String?,
+      commandSubscribeTopic: topicPolicy['command_subscribe_topic'] as String?,
+      apiKeyMasked: apiKeyMasked,
+      wsHeartbeatTimeoutSeconds: _wsHeartbeatTimeoutSeconds,
+      wsSchemaVersion: _wsSchemaVersion,
+    );
+  }
+
+  Future<Map<String, dynamic>> ackAlert({
+    required String alertId,
+    required String operator,
+  }) async {
+    return _apiService.ackIotAlert(alertId: alertId, operator: operator);
+  }
+
+  Future<Map<String, dynamic>> closeAlert({
+    required String alertId,
+    required String operator,
+    required String reason,
+  }) async {
+    return _apiService.closeIotAlert(
+      alertId: alertId,
+      operator: operator,
+      reason: reason,
+    );
+  }
+
+  Future<Map<String, dynamic>> listAlerts() async {
+    return _apiService.listIotAlerts();
+  }
+
+  Future<Map<String, dynamic>> runPhaseThreeE2ESmoke() async {
+    final List<FieldAsset> assets = await _dbHelper.getAllAssets();
+    if (assets.isEmpty) {
+      return {
+        'status': 'error',
+        'error_code': 'NO_ASSET_FOR_E2E',
+        'message': 'E2E smoke testi icin once en az bir varlik olusturun',
+      };
+    }
+    final String assetId = assets.first.id;
+    final SharedPreferences prefs = await SharedPreferences.getInstance();
+    final String deviceId = prefs.getString('field_device_id') ?? const Uuid().v4();
+    await prefs.setString('field_device_id', deviceId);
+    final Completer<Map<String, dynamic>> wsCompleter =
+        Completer<Map<String, dynamic>>();
+    final StreamSubscription<Map<String, dynamic>> wsSubscription =
+        liveEventStream.listen((Map<String, dynamic> event) {
+      final String type = (event['type'] as String?) ?? '';
+      final String eventAssetId = (event['asset_id'] as String?) ?? '';
+      if (type == 'telemetry' && eventAssetId == assetId && !wsCompleter.isCompleted) {
+        wsCompleter.complete(event);
+      }
+    });
+    try {
+      await startLiveEventStream();
+      final Map<String, dynamic> telemetryResponse =
+          await _apiService.ingestTelemetry(
+        assetId: assetId,
+        deviceId: deviceId,
+        metrics: <String, dynamic>{'temperature': 22.1, 'humidity': 51.2},
+      );
+      final bool telemetryOk = (telemetryResponse['status'] as String?) == 'ok';
+      if (!telemetryOk) {
+        return {
+          'status': 'error',
+          'error_code':
+              telemetryResponse['error_code'] ?? 'E2E_TELEMETRY_FAILED',
+          'message':
+              telemetryResponse['message'] ?? 'Telemetry ingest basarisiz',
+        };
+      }
+      Map<String, dynamic>? wsEvent;
+      try {
+        wsEvent = await wsCompleter.future.timeout(
+          const Duration(seconds: 12),
+        );
+      } catch (_) {
+        wsEvent = null;
+      }
+      if (wsEvent == null) {
+        return {
+          'status': 'error',
+          'error_code': 'E2E_WS_EVENT_TIMEOUT',
+          'message': 'Telemetry event ws/live uzerinden alinamadi',
+        };
+      }
+      return {
+        'status': 'ok',
+        'asset_id': assetId,
+        'device_id': deviceId,
+        'ws_event_type': wsEvent['type'],
+        'ws_schema_version': wsEvent['schema_version'],
+      };
+    } finally {
+      await wsSubscription.cancel();
+    }
   }
 }
